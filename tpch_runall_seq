@@ -70,7 +70,7 @@ do
     $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME <"$BASEDIR/$f" 2> stats.txt
   restart_drop_caches
 
-  sudo chown $USER:$USER *
+  sudo chown "$USER:$(id -gn)" *
   chmod 775 .
   cd - >/dev/null
 done

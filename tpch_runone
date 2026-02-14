@@ -3,10 +3,7 @@
 ###
 # This script runs a single query
 #   * 1) Gather execution time using '/usr/bin/time'
-#   * 2) Collect data with perf to generate callgraph
-#   * 3) Collect a set of basic statistics, again using perf. For now we obtain
-#     the default given by perf, but this can be modified later to extract
-#     statistics of interest to us.
+#   * 2) Collect data with perf
 ###
 
 BASEDIR=$(dirname "$0")
@@ -24,72 +21,153 @@ PERFDATADIR="$PERFDATADIR-${SCALE}GB"
 if [ $# -eq 2 ]; then
   PERFDATADIR="$PERFDATADIR-$2"
 fi
+PERF_ENABLE="${PERF_ENABLE:-1}"
+PERF_SAMPLE_PERIOD="${PERF_SAMPLE_PERIOD:-2000}"
+TPCH_PERF_OUT_DIR="${TPCH_PERF_OUT_DIR:-}"
+TPCH_PERF_CLEAN="${TPCH_PERF_CLEAN:-1}"
+TPCH_PERF_SCOPE="${TPCH_PERF_SCOPE:-all}"
 
-# perf_set_kernel_params
+PERF_SCOPE_ARGS=()
+case "$TPCH_PERF_SCOPE" in
+  user) PERF_SCOPE_ARGS+=(--all-user) ;;
+  kernel) PERF_SCOPE_ARGS+=(--all-kernel) ;;
+  all) ;;
+  *)
+    echo "Warning: invalid TPCH_PERF_SCOPE=$TPCH_PERF_SCOPE, fallback to all" >&2
+    TPCH_PERF_SCOPE="all"
+    ;;
+esac
+
+# Only preload interceptor for the PostgreSQL server process (and its forked workers).
+POSTGRES_LD_PRELOAD="${TPCH_POSTGRES_LD_PRELOAD:-${LD_PRELOAD:-}}"
+POSTGRES_MALLOC_LOG_DIR="${TPCH_MALLOC_LOG_DIR:-${MALLOC_LOG_DIR:-}}"
+POSTGRES_MALLOC_LOG_BUF_MB="${TPCH_MALLOC_LOG_BUF_MB:-${MALLOC_LOG_BUF_MB:-}}"
 
 # Start a new instance of Postgres
-# sudo -u $PGUSER taskset -c 2 $PGBINDIR/postgres -D "$PGDATADIR" -p $PGPORT &
-sudo -u $PGUSER $PGBINDIR/postgres -D "$PGDATADIR" -p $PGPORT &
+if [ -n "$POSTGRES_LD_PRELOAD" ] && [ -n "$POSTGRES_MALLOC_LOG_DIR" ]; then
+  sudo -u "$PGUSER" env \
+    LD_PRELOAD="$POSTGRES_LD_PRELOAD" \
+    MALLOC_LOG_DIR="$POSTGRES_MALLOC_LOG_DIR" \
+    MALLOC_LOG_BUF_MB="${POSTGRES_MALLOC_LOG_BUF_MB:-64}" \
+    "$PGBINDIR/postgres" -D "$PGDATADIR" -p "$PGPORT" &
+else
+  sudo -u "$PGUSER" "$PGBINDIR/postgres" -D "$PGDATADIR" -p "$PGPORT" &
+fi
 PGPID=$!
-while ! sudo -u $PGUSER $PGBINDIR/pg_ctl status -D $PGDATADIR | grep "server is running" -q; do
+while ! sudo -u "$PGUSER" "$PGBINDIR/pg_ctl" status -D "$PGDATADIR" | grep "server is running" -q; do
   echo "Waiting for the Postgres server to start"
   sleep 1
 done
 
-# wait for it to finish starting
 sleep 5
 echo "Postgres running, pid $PGPID"
 
-ii=$(printf "%02d" $1)
-dir="$PERFDATADIR/q${ii}"
-mkdir -p $dir
+ii=$(printf "%02d" "$1")
+if [ -n "$TPCH_PERF_OUT_DIR" ]; then
+  dir="$TPCH_PERF_OUT_DIR"
+else
+  dir="$PERFDATADIR/q${ii}"
+fi
+mkdir -p "$dir"
 cd "$dir"
 chmod 777 .
+if [ "$TPCH_PERF_CLEAN" = "1" ] || [ "$TPCH_PERF_CLEAN" = "true" ]; then
+  rm -f exectime.txt perf.record.log perf.data perf.data.*
+fi
 
 ### Query to be executed
 f="queries/q$ii.sql"
-fe="queries/q$ii.explain.sql"
-fa="queries/q$ii.analyze.sql"
 
-### Execute query with explain analyze to get query plan
-# echo "Execute query with explain analyze to get query plan"
-# sudo -u $PGUSER $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME <"$BASEDIR/$fa" > analyze.txt
-# restart_drop_caches
+echo "Running query q${ii} from: $BASEDIR/$f"
+echo "Query command: $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME < $BASEDIR/$f"
 
-### Collect data with perf to generate callgraph
-# echo "Collect data with perf to generate callgraph"
-# /usr/bin/time -f '%e\n%Uuser %Ssystem %Eelapsed %PCPU (%Xtext+%Ddata %Mmax)k'\
-#   sudo -u $PGUSER perf record -a -C 2 -s -g -m 512 --\
-#   $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME <"$BASEDIR/$f" 2> exectime.txt
-# restart_drop_caches
+PERF_EVENT=""
+if [ "$PERF_ENABLE" = "1" ] || [ "$PERF_ENABLE" = "true" ]; then
+  if sudo -u "$PGUSER" perf record --dry-run "${PERF_SCOPE_ARGS[@]}" -e mem-loads/ldlat=128/pp -- true >/dev/null 2>&1; then
+    PERF_EVENT="mem-loads/ldlat=128/pp"
+  elif sudo -u "$PGUSER" perf record --dry-run "${PERF_SCOPE_ARGS[@]}" -e cpu/mem-loads,ldlat=128/pp -- true >/dev/null 2>&1; then
+    PERF_EVENT="cpu/mem-loads,ldlat=128/pp"
+  elif sudo -u "$PGUSER" perf record --dry-run "${PERF_SCOPE_ARGS[@]}" -e cycles -- true >/dev/null 2>&1; then
+    PERF_EVENT="cycles"
+  fi
+fi
 
-/usr/bin/time -f '%e\n%Uuser %Ssystem %Eelapsed %PCPU (%Xtext+%Ddata %Mmax)k'\
-  sudo -u $PGUSER \
-  $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME <"$BASEDIR/$f" 2> exectime.txt
-# restart_drop_caches
+if [ -n "$PERF_EVENT" ]; then
+  echo "Using perf event: $PERF_EVENT"
+  echo "Perf scope: $TPCH_PERF_SCOPE"
 
-### Collect basic stats with perf
-# echo "Collect basic stats with perf"
-# sudo -u $PGUSER perf stat -a -C 2 -B --log-fd 2 --\
-#   $PGBINDIR/psql -h /tmp -p $PGPORT -d $DB_NAME <"$BASEDIR/$f" 2> stats.txt
-# restart_drop_caches
+  TMP_PSQL_ERR=$(mktemp)
+  /usr/bin/time -f '%e\n%Uuser %Ssystem %Eelapsed %PCPU (%Xtext+%Ddata %Mmax)k' -o exectime.txt \
+    sudo -u "$PGUSER" \
+    "$PGBINDIR/psql" -h /tmp -p "$PGPORT" -d "$DB_NAME" <"$BASEDIR/$f" 2>"$TMP_PSQL_ERR" &
+  PSQL_PID=$!
 
-sudo chown $USER:$USER *
-chmod 775 .
+  BACKEND_PID=""
+  for _ in $(seq 1 400); do
+    if ! kill -0 "$PSQL_PID" 2>/dev/null; then
+      break
+    fi
+    BACKEND_PID="$(ps -eo pid=,args= | awk -v db="$DB_NAME" '$0 ~ ("postgres: .* " db " .*SELECT") {print $1; exit}')"
+    if [ -n "$BACKEND_PID" ] && [ -d "/proc/$BACKEND_PID" ]; then
+      break
+    fi
+    sleep 0.05
+  done
 
-# cgf="../q${ii}-callgraph.pdf"
-# echo "Creating the call graph: $cgf"
-# perf script | python "$BASEDIR/gprof2dot.py" -f perf | dot -Tpdf -o $cgf &
+  if [ -n "$BACKEND_PID" ] && [ -d "/proc/$BACKEND_PID" ]; then
+    BACKEND_CMD="$(ps -p "$BACKEND_PID" -o args= 2>/dev/null || true)"
+    {
+      echo "Recording postgres backend pid: $BACKEND_PID"
+      echo "Backend cmdline: ${BACKEND_CMD}"
+    } | tee perf.record.log
+    perf record \
+      "${PERF_SCOPE_ARGS[@]}" \
+      -e "$PERF_EVENT" \
+      -c "$PERF_SAMPLE_PERIOD" \
+      -W -d \
+      --timestamp-filename \
+      -o perf.data \
+      -p "$BACKEND_PID" \
+      >> perf.record.log 2>&1 &
+    PERF_PID=$!
+  else
+    echo "Warning: postgres backend pid not found in time; no perf capture." | tee perf.record.log
+    PERF_PID=""
+  fi
 
-# Statistics collection
-#   perf script | python "$BASEDIR/gprof2dot.py" -f perf | python "$BASEDIR/collect_stats.py" $i > q${ii}-breakdown.csv
+  wait "$PSQL_PID"
+  PSQL_RC=$?
+
+  if [ -n "$PERF_PID" ]; then
+    kill -INT "$PERF_PID" 2>/dev/null || true
+    wait "$PERF_PID" 2>/dev/null || true
+  fi
+
+  if [ -s "$TMP_PSQL_ERR" ]; then
+    cat "$TMP_PSQL_ERR" | tee -a perf.record.log >&2
+  fi
+  rm -f "$TMP_PSQL_ERR"
+
+  if [ "$PSQL_RC" -ne 0 ]; then
+    echo "Warning: query exited with status $PSQL_RC" >&2
+  fi
+else
+  if [ "$PERF_ENABLE" = "1" ] || [ "$PERF_ENABLE" = "true" ]; then
+    echo "Warning: perf record unavailable; running query without perf capture." >&2
+  else
+    echo "Perf disabled (PERF_ENABLE=$PERF_ENABLE); running query without perf capture." >&2
+  fi
+  /usr/bin/time -f '%e\n%Uuser %Ssystem %Eelapsed %PCPU (%Xtext+%Ddata %Mmax)k' -o exectime.txt \
+    sudo -u "$PGUSER" \
+    "$PGBINDIR/psql" -h /tmp -p "$PGPORT" -d "$DB_NAME" <"$BASEDIR/$f"
+fi
+
+shopt -s nullglob
+files=(*)
+if [ ${#files[@]} -gt 0 ]; then
+  sudo chown "$USER:$(id -gn)" "${files[@]}"
+  chmod 775 "${files[@]}"
+fi
+shopt -u nullglob
 
 cd - >/dev/null
-
-# Stop the server
-# sudo -u $PGUSER $PGBINDIR/pg_ctl stop -D $PGDATADIR
-
-# for p in $(jobs -p);
-# do
-#   wait $p
-# done
